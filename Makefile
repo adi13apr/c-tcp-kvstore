@@ -8,7 +8,7 @@ BUILD   := build
 COMMON  := $(BUILD)/hashtable.o $(BUILD)/buffer.o $(BUILD)/protocol.o $(BUILD)/net.o
 UNITS   := $(BUILD)/test_hashtable $(BUILD)/test_protocol $(BUILD)/test_threadpool
 
-.PHONY: all unit test valgrind bench clean
+.PHONY: all unit test valgrind tsan bench clean
 
 all: server epoll_server client
 
@@ -40,6 +40,22 @@ test: unit server epoll_server
 
 valgrind: all $(UNITS)
 	tests/valgrind_check.sh
+
+# ThreadSanitizer build of everything multi-threaded, then the same tests.
+TSAN_DIR := $(BUILD)/tsan
+TSAN_CC   = $(CC) -std=c11 -D_GNU_SOURCE -O1 -g -fsanitize=thread -Isrc -Itests -pthread
+TSAN_LIB := src/hashtable.c src/buffer.c src/protocol.c src/net.c
+
+tsan: | $(BUILD)
+	mkdir -p $(TSAN_DIR)
+	$(TSAN_CC) src/server.c src/threadpool.c $(TSAN_LIB) -o $(TSAN_DIR)/server
+	$(TSAN_CC) src/epoll_server.c $(TSAN_LIB) -o $(TSAN_DIR)/epoll_server
+	$(TSAN_CC) tests/test_hashtable.c $(TSAN_LIB) -o $(TSAN_DIR)/test_hashtable
+	$(TSAN_CC) tests/test_threadpool.c src/threadpool.c -o $(TSAN_DIR)/test_threadpool
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_DIR)/test_hashtable
+	TSAN_OPTIONS=halt_on_error=1 $(TSAN_DIR)/test_threadpool
+	TSAN_OPTIONS=halt_on_error=1 python3 tests/functional_test.py --server $(TSAN_DIR)/server
+	TSAN_OPTIONS=halt_on_error=1 python3 tests/functional_test.py --server $(TSAN_DIR)/epoll_server --extra=-t4
 
 bench: all
 	python3 bench/run_bench.py

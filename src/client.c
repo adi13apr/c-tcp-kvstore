@@ -6,8 +6,16 @@
  * responses, and records the batch's round-trip time. All threads start
  * together on a barrier; throughput is total responses / wall time.
  *
- * Output ends with a machine-readable line used by bench/run_bench.sh:
- *   RESULT rps=... p50_us=... p99_us=... p999_us=... max_us=... errors=...
+ * "First reply" is the time from the start until a connection receives its
+ * first response; its worst case exposes connections left waiting (e.g. in
+ * the thread-pool server's queue), which per-request latency hides because
+ * each connection contributes only one such sample.
+ *
+ * -I opens extra connections that stay idle for the whole run.
+ *
+ * Output ends with a machine-readable line used by bench/run_bench.py:
+ *   RESULT rps=... p50_us=... p99_us=... p999_us=... max_us=...
+ *          first_p50_us=... first_max_us=... errors=...
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -34,6 +42,7 @@ typedef struct {
     long get_pct;
     long keyspace;
     long value_size;
+    long idle;
     int populate;
 } opts_t;
 
@@ -43,6 +52,7 @@ typedef struct {
     pthread_barrier_t *start;
     uint32_t *lat_us; /* one sample per batch */
     long nlat;
+    double first_us;  /* start -> first response, or -1 */
     long done;        /* responses received */
     long errors;      /* ERR responses, plus 1 if the connection failed */
 } worker_t;
@@ -149,6 +159,7 @@ static void *worker_main(void *arg)
         ok = r.fd >= 0;
     }
     pthread_barrier_wait(w->start); /* even on failure, or main would hang */
+    double started = now_sec();
 
     for (long sent = 0; ok && sent < o->requests;) {
         long batch = o->pipeline;
@@ -175,8 +186,11 @@ static void *worker_main(void *arg)
         }
         if (!ok)
             break;
-        double us = (now_sec() - t0) * 1e6;
+        double t1 = now_sec();
+        double us = (t1 - t0) * 1e6;
         w->lat_us[w->nlat++] = us > UINT32_MAX ? UINT32_MAX : (uint32_t)us;
+        if (w->first_us < 0)
+            w->first_us = (t1 - started) * 1e6;
         sent += batch;
     }
 
@@ -224,6 +238,12 @@ static int populate(const opts_t *o)
     return rc;
 }
 
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
 static int cmp_u32(const void *a, const void *b)
 {
     uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
@@ -242,7 +262,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s [-h host] [-p port] [-c conns] [-n reqs] [-P depth]\n"
-            "          [-r get%%] [-k keys] [-d bytes] [-W]\n"
+            "          [-r get%%] [-k keys] [-d bytes] [-I idle] [-W]\n"
             "  -h  server IPv4 address           (default 127.0.0.1)\n"
             "  -p  server port                   (default 7379)\n"
             "  -c  concurrent connections        (default 50)\n"
@@ -251,6 +271,7 @@ static void usage(const char *prog)
             "  -r  percentage of GETs            (default 80)\n"
             "  -k  keyspace size                 (default 10000)\n"
             "  -d  value size in bytes           (default 32)\n"
+            "  -I  extra connections held idle   (default 0)\n"
             "  -W  skip pre-populating the keyspace\n",
             prog);
 }
@@ -263,7 +284,7 @@ int main(int argc, char **argv)
     int opt;
     long port = o.port;
 
-    while ((opt = getopt(argc, argv, "h:p:c:n:P:r:k:d:W")) != -1) {
+    while ((opt = getopt(argc, argv, "h:p:c:n:P:r:k:d:I:W")) != -1) {
         switch (opt) {
         case 'h': o.host = optarg; break;
         case 'p': port = net_parse_long(optarg, 1, 65535); break;
@@ -273,11 +294,12 @@ int main(int argc, char **argv)
         case 'r': o.get_pct = net_parse_long(optarg, 0, 100); break;
         case 'k': o.keyspace = net_parse_long(optarg, 1, 1L << 32); break;
         case 'd': o.value_size = net_parse_long(optarg, 0, 60000); break;
+        case 'I': o.idle = net_parse_long(optarg, 0, 20000); break;
         case 'W': o.populate = 0; break;
         default: usage(argv[0]); return 2;
         }
         if (port < 0 || o.conns < 0 || o.requests < 0 || o.pipeline < 0 ||
-            o.get_pct < 0 || o.keyspace < 0 || o.value_size < 0) {
+            o.get_pct < 0 || o.keyspace < 0 || o.value_size < 0 || o.idle < 0) {
             usage(argv[0]);
             return 2;
         }
@@ -290,6 +312,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Connected before the active ones, so a FIFO server sees them first. */
+    int *idle = calloc((size_t)o.idle + 1, sizeof *idle);
+    for (long i = 0; i < o.idle; i++) {
+        if ((idle[i] = dial(&o)) < 0) {
+            fprintf(stderr, "client: cannot open idle connection %ld\n", i);
+            return 1;
+        }
+    }
+
     worker_t *ws = calloc((size_t)o.conns, sizeof *ws);
     pthread_t *th = calloc((size_t)o.conns, sizeof *th);
     long batches = (o.requests + o.pipeline - 1) / o.pipeline;
@@ -300,7 +331,7 @@ int main(int argc, char **argv)
     pthread_attr_setstacksize(&attr, 256 * 1024); /* allow thousands of conns */
 
     for (long i = 0; i < o.conns; i++) {
-        ws[i] = (worker_t){ .id = (int)i, .o = &o, .start = &start,
+        ws[i] = (worker_t){ .id = (int)i, .o = &o, .start = &start, .first_us = -1,
                             .lat_us = malloc((size_t)batches * sizeof(uint32_t)) };
         if (!ws[i].lat_us || pthread_create(&th[i], &attr, worker_main, &ws[i]) != 0) {
             fprintf(stderr, "client: cannot start connection %ld\n", i);
@@ -312,14 +343,20 @@ int main(int argc, char **argv)
     for (long i = 0; i < o.conns; i++)
         pthread_join(th[i], NULL);
     double elapsed = now_sec() - t0;
+    for (long i = 0; i < o.idle; i++)
+        close(idle[i]);
+    free(idle);
 
     long done = 0, errors = 0;
     size_t nlat = 0;
     for (long i = 0; i < o.conns; i++)
         nlat += (size_t)ws[i].nlat;
     uint32_t *lat = malloc((nlat ? nlat : 1) * sizeof *lat);
-    size_t off = 0;
+    double *first = malloc((size_t)o.conns * sizeof *first);
+    size_t off = 0, nfirst = 0;
     for (long i = 0; i < o.conns; i++) {
+        if (ws[i].first_us >= 0)
+            first[nfirst++] = ws[i].first_us;
         done += ws[i].done;
         errors += ws[i].errors;
         memcpy(lat + off, ws[i].lat_us, (size_t)ws[i].nlat * sizeof *lat);
@@ -327,22 +364,32 @@ int main(int argc, char **argv)
         free(ws[i].lat_us);
     }
     qsort(lat, nlat, sizeof *lat, cmp_u32);
+    qsort(first, nfirst, sizeof *first, cmp_double);
+    double first_p50 = nfirst ? first[nfirst / 2] : 0;
+    double first_max = nfirst ? first[nfirst - 1] : 0;
 
     double rps = elapsed > 0 ? (double)done / elapsed : 0;
     uint32_t p50 = pct(lat, nlat, 50), p99 = pct(lat, nlat, 99),
              p999 = pct(lat, nlat, 99.9), mx = nlat ? lat[nlat - 1] : 0;
 
     printf("target       %s:%d\n", o.host, o.port);
-    printf("workload     %ld conns x %ld reqs, pipeline %ld, %ld%% GET, %ld keys, %ldB values\n",
+    printf("workload     %ld conns x %ld reqs, pipeline %ld, %ld%% GET, %ld keys, %ldB values",
            o.conns, o.requests, o.pipeline, o.get_pct, o.keyspace, o.value_size);
+    if (o.idle)
+        printf(", +%ld idle conns", o.idle);
+    printf("\n");
     printf("completed    %ld requests in %.3f s\n", done, elapsed);
     printf("throughput   %.0f req/s\n", rps);
     printf("latency      p50 %.3f ms  p99 %.3f ms  p99.9 %.3f ms  max %.3f ms (per round trip)\n",
            p50 / 1e3, p99 / 1e3, p999 / 1e3, mx / 1e3);
+    printf("first reply  median %.3f ms  worst %.3f ms (start -> a connection's first response)\n",
+           first_p50 / 1e3, first_max / 1e3);
     printf("errors       %ld\n", errors);
-    printf("RESULT rps=%.0f p50_us=%u p99_us=%u p999_us=%u max_us=%u errors=%ld\n",
-           rps, p50, p99, p999, mx, errors);
+    printf("RESULT rps=%.0f p50_us=%u p99_us=%u p999_us=%u max_us=%u "
+           "first_p50_us=%.0f first_max_us=%.0f errors=%ld\n",
+           rps, p50, p99, p999, mx, first_p50, first_max, errors);
 
+    free(first);
     free(lat);
     free(ws);
     free(th);
