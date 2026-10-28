@@ -210,7 +210,80 @@ Details:
 
 ## Benchmark results
 
-BENCH_TABLE_PLACEHOLDER
+Reproduce with `make bench` (`python3 bench/run_bench.py --reps 5` produced
+the numbers below; raw output is in [`bench/results.md`](bench/results.md)).
+
+**Setup.** 4-vCPU VM (Intel Xeon @ 2.8 GHz, Linux 6.18, gcc 13.3 `-O2`),
+loopback TCP, **client and server on the same 4 vCPUs**, so the absolute
+numbers are low and only the comparisons mean anything. Workload: 80% GET / 20% SET over
+100k prepopulated keys, 32-byte values, 400k requests per run, each connection
+closed-loop (send a batch of `pipeline` requests, wait for all replies). Each cell
+is the median of 5 runs, on a fresh server per cell. The thread-pool server ran with
+`-t 8 -i 2` (8 workers, 2 s idle timeout).
+
+* **RTT**: time for one batch round trip, per connection.
+* **worst first reply**: time from the start until the *last* connection got its
+  first response. It is the column that shows connections left waiting in the
+  pool's queue, because each connection contributes only one such sample, so the waits
+  barely move p99.
+
+| Workload | Server | Throughput (req/s) | range over 5 runs | p50 RTT | p99 RTT | worst first reply |
+|---|---|---:|---:|---:|---:|---:|
+| 8 conns | thread pool (8 workers) | **292,975** | 163k - 301k | 0.016 ms | 0.074 ms | 0.4 ms |
+| 8 conns | epoll (1 loop) | **47,064** | 47k - 47k | 0.142 ms | 0.351 ms | 0.3 ms |
+| 8 conns | epoll (4 loops) | **114,023** | 101k - 131k | 0.029 ms | 0.185 ms | 0.4 ms |
+| 64 conns | thread pool (8 workers) | **296,201** | 275k - 304k | 0.018 ms | 0.096 ms | **1119.6 ms** |
+| 64 conns | epoll (1 loop) | **46,945** | 46k - 48k | 1.316 ms | 2.135 ms | 2.7 ms |
+| 64 conns | epoll (4 loops) | **133,538** | 130k - 143k | 0.340 ms | 1.853 ms | 8.2 ms |
+| 256 conns | thread pool (8 workers) | **217,626** | 155k - 316k | 0.021 ms | 0.179 ms | **1722.6 ms** |
+| 256 conns | epoll (1 loop) | **42,415** | 41k - 45k | 5.769 ms | 7.916 ms | 10.1 ms |
+| 256 conns | epoll (4 loops) | **142,669** | 133k - 154k | 1.391 ms | 5.170 ms | 4.1 ms |
+| 64 conns, pipeline 16 | thread pool (8 workers) | **1,109,851** | 1.02M - 3.32M | 0.097 ms | 0.322 ms | 325.8 ms |
+| 64 conns, pipeline 16 | epoll (1 loop) | **505,474** | 496k - 522k | 1.918 ms | 3.901 ms | 3.5 ms |
+| 64 conns, pipeline 16 | epoll (4 loops) | **1,368,704** | 1.18M - 1.52M | 0.580 ms | 2.918 ms | 4.4 ms |
+| 8 conns + 16 idle | thread pool (8 workers) | **72,831** | 66k - 73k | 0.014 ms | 0.078 ms | **4032.6 ms** |
+| 8 conns + 16 idle | epoll (1 loop) | **45,613** | 44k - 47k | 0.149 ms | 0.381 ms | 0.3 ms |
+| 8 conns + 16 idle | epoll (4 loops) | **120,978** | 115k - 326k | 0.037 ms | 0.199 ms | 0.2 ms |
+
+**What the numbers say**
+
+1. **When active connections ≤ workers, the thread pool has the best raw
+   throughput** (293k vs 114k req/s at 8 connections). Each request is a
+   blocking `recv` and a `send` on a thread that the kernel wakes directly, with no
+   readiness step in between. With one connection in ping-pong the two servers
+   are identical (about 19k req/s, 47 µs RTT each), so the gap at 8 connections is about
+   how the work spreads over CPUs, not about per-request cost. Each pool thread
+   serves one client and tends to share a CPU with it. Each epoll loop serves
+   several clients, which costs cross-CPU wakeups (expensive in a VM).
+2. **With more connections than workers, the pool's throughput number hides
+   starvation.** At 64 and 256 connections it still reports about 220-300k req/s,
+   but only 8 connections are ever in service. The rest sit in the queue, and the
+   last one gets its first byte after **1.1-1.7 s, i.e. essentially the whole run**.
+   Epoll serves every connection from the start: worst first reply ≤ 10 ms, and
+   latency grows smoothly with load (p50 0.34 → 1.39 ms going from 64 to 256 connections on 4 loops).
+3. **Idle connections are the thread pool's worst case.** 16 idle clients took
+   all 8 workers until the idle timeout fired twice (2 x 2 s), so active clients waited
+   **4 s** for a first reply, and throughput fell to 73k. With the default `-i 60`
+   that stall would be 2 minutes. Epoll doesn't notice: an idle connection costs a
+   struct in a list and no thread.
+4. **One epoll loop is CPU-bound on a single core at about 45k req/s.** `strace -c`
+   confirms the loop does only one `recvfrom` + one `sendto` per request.
+   The time is kernel networking, which on loopback includes delivering each reply
+   to the peer, all charged to that one core. More loops scale it out (3x with 4 loops),
+   and so does **pipelining**: 16 requests per round trip amortize the syscalls and
+   wakeups, taking one loop to 505k and 4 loops to **1.37M req/s**, the best
+   median in the table. The pool's pipelined number swings 1.0-3.3M between runs, and its
+   queued connections still wait 326 ms.
+5. **Variance.** Cells whose range is wide (pool at 8 and 256 conns, epoll-4 with idle
+   connections) depend on where the scheduler places 8-16 busy threads on 4
+   vCPUs shared with the client. Single-loop epoll is the most repeatable configuration
+   (±3%) because it has the fewest threads to place.
+
+**Bottom line:** the thread pool is a good fit for a small, known number of
+busy clients (e.g. a fixed set of application servers). The event loop is the
+right design when the number of connections is large, unknown or mostly idle,
+because it serves every client fairly and its cost grows with *activity*, not
+with *connections*.
 
 ## Design decisions
 
@@ -363,8 +436,8 @@ small connection counts (8 connections over 4 loops can easily split 4/2/1/1).
 The final design is the classic main-reactor/sub-reactor pattern: loop 0
 accepts and deals fds round-robin into each loop's mutex-protected inbox, then
 pokes that loop's `eventfd`. The split is exactly even, and the only lock is
-taken once per new connection. That fix raised 8-connection throughput with
-`-t 4` from about 46k to about 120-230k req/s.
+taken once per new connection. With that change, `-t 4` at 8 connections went
+from the same 46k req/s as one loop to 114k (median of 5 runs, range 101-131k).
 
 ### Smaller choices
 
