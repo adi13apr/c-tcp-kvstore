@@ -16,21 +16,23 @@ immunity, and a graceful SIGINT/SIGTERM shutdown. Both run clean under valgrind
 
 ```
 src/
-  hashtable.[ch]    striped-rwlock chained hash table with online resize
-  protocol.[ch]     request framing, parsing and execution (shared by both servers)
-  buffer.[ch]       growable byte buffer
-  net.[ch]          listen socket, send_all, small socket helpers
-  threadpool.[ch]   fixed worker pool, bounded ring-buffer queue, mutex + condvar
-  server.c          thread-pool server
-  epoll_server.c    epoll server
-  client.c          load-test client
+  hashtable.[ch]   striped-rwlock table
+  protocol.[ch]    framing + commands
+  buffer.[ch]      byte buffer
+  net.[ch]         socket helpers
+  threadpool.[ch]  pool + bounded queue
+  server.c         thread-pool server
+  epoll_server.c   epoll server
+  client.c         load-test client
 tests/
-  test_*.c          unit tests (hash table incl. concurrent resize, protocol, pool)
-  functional_test.py  end-to-end tests run against either server
-  valgrind_check.sh   everything under valgrind, incl. SIGINT during load
+  test_*.c         unit tests
+  functional_test.py
+                   end-to-end tests
+  valgrind_check.sh
+                   all under valgrind
 bench/
-  run_bench.py      benchmark matrix -> Markdown table
-  results.md        raw output of the run quoted below
+  run_bench.py     benchmark matrix
+  results.md       raw results
 ```
 
 ## Architecture
@@ -38,63 +40,94 @@ bench/
 ### Thread-pool server (`server`)
 
 ```
-                              +------------------------------------------------+
-  clients ---TCP---> listen fd |  MAIN THREAD (acceptor)                        |
-                               |   poll([signalfd, listen fd])                  |
-  SIGINT/SIGTERM --> signalfd  |     |                                          |
-                               |     | accept4() -> TCP_NODELAY, SO_RCV/SNDTIMEO |
-                               |     v                                          |
-                               |   tp_submit(fd) --full--> "ERR server busy",   |
-                               |     |                     close (load shedding)|
-                               |     v                                          |
-                               |  +------------------------------------------+  |
-                               |  | bounded ring buffer of jobs (FIFO)       |  |
-                               |  | pthread_mutex_t lock                     |  |
-                               |  | pthread_cond_t  not_empty                |  |
-                               |  +------------------------------------------+  |
-                               |     | pop (pthread_cond_wait while empty)      |
-                               |     +-----------+-----------+-----------+      |
-                               |     v           v           v           v      |
-                               |  worker 0    worker 1     ...     worker N-1   |
-                               |  each owns ONE connection until it closes:     |
-                               |  blocking recv -> proto_process -> send_all    |
-                               |     |                                          |
-                               |     |  active-connection registry (mutex):     |
-                               |     |  on shutdown, shutdown(fd, SHUT_RD)      |
-                               |     |  wakes every blocked recv()              |
-                               |     +--------------------+                     |
-                               |                          v                     |
-                               |   +-----------------------------------------+  |
-                               |   | hash table: buckets[], 64 striped       |  |
-                               |   | rwlocks, bucket i -> stripe i & 63      |  |
-                               |   +-----------------------------------------+  |
-                               +------------------------------------------------+
+ clients          SIGINT/SIGTERM
+    |                   |
+ listen fd          signalfd
+    |                   |
+    +--------+----------+
+             | poll() both
+             v
+ MAIN THREAD (acceptor)
+   accept4(), TCP_NODELAY,
+   SO_RCVTIMEO, SO_SNDTIMEO
+             |
+       tp_submit(fd)
+             |  queue full?
+             |  -> "ERR server busy",
+             |     close
+             v
+ +------------------------------+
+ | WORK QUEUE (bounded, FIFO)   |
+ |  pthread_mutex_t lock        |
+ |  pthread_cond_t  not_empty   |
+ +------------------------------+
+    | pop; cond_wait if empty
+    +------+------+-------+
+    v      v      v       v
+   w0     w1     ...    wN-1
+
+ Each worker owns ONE connection
+ until it closes (blocking I/O):
+   recv -> proto_process
+        -> send_all
+    |
+    | live-fd registry (mutex):
+    | on SIGINT, shutdown(SHUT_RD)
+    | wakes every blocked recv()
+    v
+ +------------------------------+
+ | HASH TABLE                   |
+ |  buckets[], 64 striped       |
+ |  rwlocks; bucket i uses      |
+ |  stripe (i & 63)             |
+ +------------------------------+
 ```
 
 ### Epoll server (`epoll_server -t N`)
 
 ```
-  SIGINT/SIGTERM --> MAIN THREAD: sigwait() --write--> stop eventfd (watched by every loop)
+ SIGINT/SIGTERM
+      |
+      v
+ MAIN THREAD: sigwait(), then
+ write(stop eventfd), which every
+ loop watches
 
-  +------------------- loop 0 -------------------+     +------------ loop k (1..N-1) ------------+
-  | epoll_wait over:                             |     | epoll_wait over:                        |
-  |   listen fd (non-blocking)                   |     |   stop eventfd                          |
-  |   stop eventfd, own wake eventfd             |     |   own wake eventfd                      |
-  |   its own connections                        |     |   its own connections                   |
-  |                                              |     |                                         |
-  | accept4() --round robin--+-> conn_add(self)  |     |   wake -> drain inbox -> conn_add()     |
-  |                          +-> inbox[k] (mutex)| ==> |                                         |
-  |                              + write(wake k) |     |                                         |
-  +----------------------------------------------+     +-----------------------------------------+
-           per connection, on one loop for its whole life (no locking of connection state):
+ +- LOOP 0 --------------------------+
+ | epoll_wait: listen fd, stop efd,  |
+ |   own wake efd, own connections   |
+ | accept4(), then round-robin:      |
+ |   to self   -> conn_add()         |
+ |   to loop k -> inbox[k] (mutex)   |
+ |                + write(wake[k])   |
+ +----------------+------------------+
+                  | hand-off
+                  v
+ +- LOOP k (1 .. N-1) ---------------+
+ | epoll_wait: stop efd,             |
+ |   own wake efd, own connections   |
+ | wake -> drain inbox -> conn_add() |
+ +-----------------------------------+
 
-    recv (one read per EPOLLIN) -> in buf -> proto_process -> out buf -> send (non-blocking)
-       ^                                                                    |
-       |  EPOLLIN  only while peer may send AND pending output < 256 KiB    |  partial write:
-       |           (backpressure for clients that don't read)               |  keep offset,
-       +--- EPOLLOUT only while output is pending <-------------------------+  enable EPOLLOUT
+ EACH CONNECTION stays on one loop,
+ so its state needs no locks:
 
-           all loops ---> shared hash table (same striped-rwlock table as above)
+   EPOLLIN -> recv() once -> in buf
+                               |
+          proto_process  <-----+
+                |
+                v
+   out buf -> send() (non-blocking)
+     |
+     +- all sent:  EPOLLOUT off
+     +- partial:   keep offset,
+     |             EPOLLOUT on
+     +- > 256 KiB pending:
+                   EPOLLIN off
+                   (backpressure)
+
+ all loops -> shared hash table
+              (striped rwlocks)
 ```
 
 ## Build and run
@@ -103,37 +136,45 @@ Requirements: Linux, gcc or clang with C11, GNU make, Python 3 (tests and
 bench only), valgrind (for `make valgrind`).
 
 ```sh
-make                 # builds ./server ./epoll_server ./client (all targets)
-make server          # individual targets
+make              # all 3 binaries
+make server       # or one target
 make epoll_server
 make client
 
-make test            # unit tests + functional tests against both servers
-make valgrind        # everything under valgrind; fails on any error or leak
-make tsan            # ThreadSanitizer builds + the same tests
-make bench           # benchmark matrix (needs an otherwise idle machine)
+make test         # unit + functional
+make valgrind     # fail on any leak
+make tsan         # ThreadSanitizer
+make bench        # benchmark
 make clean
 ```
 
 Run a server (Ctrl-C shuts it down gracefully):
 
 ```sh
-./server       -p 7379 -t 8 -q 1024 -i 60   # 8 workers, queue 1024, 60 s idle timeout
-./epoll_server -p 7379 -t 4                 # 4 event loops
+# 8 workers, queue of 1024,
+# 60 s idle timeout
+./server -p 7379 -t 8 -q 1024 -i 60
+
+# 4 event loops
+./epoll_server -p 7379 -t 4
 ```
 
-| Flag | `server` | `epoll_server` | Default |
-|---|---|---|---|
-| `-a addr` | bind address | bind address | `127.0.0.1` |
-| `-p port` | TCP port | TCP port | `7379` |
-| `-t n`    | worker threads | event-loop threads | 8 / 1 |
-| `-q n`    | pending-connection queue capacity | - | 1024 |
-| `-i sec`  | per-connection idle/send timeout (0 = none) | - | 60 |
+| Flag | Meaning (default) |
+|---|---|
+| `-a addr` | bind address (`127.0.0.1`) |
+| `-p port` | TCP port (7379) |
+| `-t n` | `server`: worker threads (8); `epoll_server`: event loops (1) |
+| `-q n` | `server` only: queue size for waiting connections (1024) |
+| `-i sec` | `server` only: idle/send timeout, 0 = off (60) |
 
 Talk to it with any line-based tool:
 
 ```sh
-$ printf 'PING\nSET greeting hello world\nGET greeting\nDEL greeting\nGET greeting\n' | nc -N 127.0.0.1 7379
+$ printf '%s\n' PING \
+    'SET greeting hello world' \
+    'GET greeting' 'DEL greeting' \
+    'GET greeting' \
+  | nc -N 127.0.0.1 7379
 PONG
 OK
 VALUE hello world
@@ -144,9 +185,12 @@ NOT_FOUND
 Load test:
 
 ```sh
-./client -p 7379 -c 64 -n 10000 -P 1 -r 80 -k 100000 -d 32
-#  -c connections  -n requests per connection  -P pipeline depth
-#  -r % GETs  -k keyspace  -d value bytes  -I extra idle connections  -W skip prepopulate
+./client -p 7379 -c 64 -n 10000 \
+         -P 1 -r 80 -k 100000 -d 32
+# -c conns        -n reqs per conn
+# -P pipeline     -r % GETs
+# -k keyspace     -d value bytes
+# -I idle conns   -W no prepopulate
 ```
 
 ## Protocol
@@ -156,10 +200,14 @@ stripped, so `telnet`/`nc -C` work. Responses are one line each, in request
 order. Clients may pipeline any number of requests without waiting.
 
 ```
-request  = command *( SEP arg ) [ "\r" ] "\n"
-SEP      = 1*( " " / "\t" )
-key      = 1*( any byte except SP, TAB, CR, LF )
-value    = *( any byte except LF )        ; everything after the single separator that follows the key
+request = command *( SEP arg )
+          [ "\r" ] "\n"
+SEP     = 1*( " " / "\t" )
+key     = 1*( any byte except
+              SP, TAB, CR, LF )
+value   = *( any byte except LF )
+        ; everything after the one
+        ; separator after the key
 ```
 
 | Request | Success response | Other responses |
@@ -221,29 +269,32 @@ closed-loop (send a batch of `pipeline` requests, wait for all replies). Each ce
 is the median of 5 runs, on a fresh server per cell. The thread-pool server ran with
 `-t 8 -i 2` (8 workers, 2 s idle timeout).
 
+Servers: **pool** = `server -t 8`, **epoll×1** = `epoll_server -t 1`,
+**epoll×4** = `epoll_server -t 4`.
+
 * **RTT**: time for one batch round trip, per connection.
 * **worst first reply**: time from the start until the *last* connection got its
   first response. It is the column that shows connections left waiting in the
   pool's queue, because each connection contributes only one such sample, so the waits
   barely move p99.
 
-| Workload | Server | Throughput (req/s) | range over 5 runs | p50 RTT | p99 RTT | worst first reply |
+| Workload | Server | req/s | worst first reply | p50 RTT | p99 RTT | range (5 runs) |
 |---|---|---:|---:|---:|---:|---:|
-| 8 conns | thread pool (8 workers) | **292,975** | 163k - 301k | 0.016 ms | 0.074 ms | 0.4 ms |
-| 8 conns | epoll (1 loop) | **47,064** | 47k - 47k | 0.142 ms | 0.351 ms | 0.3 ms |
-| 8 conns | epoll (4 loops) | **114,023** | 101k - 131k | 0.029 ms | 0.185 ms | 0.4 ms |
-| 64 conns | thread pool (8 workers) | **296,201** | 275k - 304k | 0.018 ms | 0.096 ms | **1119.6 ms** |
-| 64 conns | epoll (1 loop) | **46,945** | 46k - 48k | 1.316 ms | 2.135 ms | 2.7 ms |
-| 64 conns | epoll (4 loops) | **133,538** | 130k - 143k | 0.340 ms | 1.853 ms | 8.2 ms |
-| 256 conns | thread pool (8 workers) | **217,626** | 155k - 316k | 0.021 ms | 0.179 ms | **1722.6 ms** |
-| 256 conns | epoll (1 loop) | **42,415** | 41k - 45k | 5.769 ms | 7.916 ms | 10.1 ms |
-| 256 conns | epoll (4 loops) | **142,669** | 133k - 154k | 1.391 ms | 5.170 ms | 4.1 ms |
-| 64 conns, pipeline 16 | thread pool (8 workers) | **1,109,851** | 1.02M - 3.32M | 0.097 ms | 0.322 ms | 325.8 ms |
-| 64 conns, pipeline 16 | epoll (1 loop) | **505,474** | 496k - 522k | 1.918 ms | 3.901 ms | 3.5 ms |
-| 64 conns, pipeline 16 | epoll (4 loops) | **1,368,704** | 1.18M - 1.52M | 0.580 ms | 2.918 ms | 4.4 ms |
-| 8 conns + 16 idle | thread pool (8 workers) | **72,831** | 66k - 73k | 0.014 ms | 0.078 ms | **4032.6 ms** |
-| 8 conns + 16 idle | epoll (1 loop) | **45,613** | 44k - 47k | 0.149 ms | 0.381 ms | 0.3 ms |
-| 8 conns + 16 idle | epoll (4 loops) | **120,978** | 115k - 326k | 0.037 ms | 0.199 ms | 0.2 ms |
+| 8 conns | pool | **292,975** | 0.4 ms | 0.016 ms | 0.074 ms | 163k - 301k |
+| 8 conns | epoll×1 | **47,064** | 0.3 ms | 0.142 ms | 0.351 ms | 47k - 47k |
+| 8 conns | epoll×4 | **114,023** | 0.4 ms | 0.029 ms | 0.185 ms | 101k - 131k |
+| 64 conns | pool | **296,201** | **1119.6 ms** | 0.018 ms | 0.096 ms | 275k - 304k |
+| 64 conns | epoll×1 | **46,945** | 2.7 ms | 1.316 ms | 2.135 ms | 46k - 48k |
+| 64 conns | epoll×4 | **133,538** | 8.2 ms | 0.340 ms | 1.853 ms | 130k - 143k |
+| 256 conns | pool | **217,626** | **1722.6 ms** | 0.021 ms | 0.179 ms | 155k - 316k |
+| 256 conns | epoll×1 | **42,415** | 10.1 ms | 5.769 ms | 7.916 ms | 41k - 45k |
+| 256 conns | epoll×4 | **142,669** | 4.1 ms | 1.391 ms | 5.170 ms | 133k - 154k |
+| 64 conns, pipeline 16 | pool | **1,109,851** | 325.8 ms | 0.097 ms | 0.322 ms | 1.02M - 3.32M |
+| 64 conns, pipeline 16 | epoll×1 | **505,474** | 3.5 ms | 1.918 ms | 3.901 ms | 496k - 522k |
+| 64 conns, pipeline 16 | epoll×4 | **1,368,704** | 4.4 ms | 0.580 ms | 2.918 ms | 1.18M - 1.52M |
+| 8 conns + 16 idle | pool | **72,831** | **4032.6 ms** | 0.014 ms | 0.078 ms | 66k - 73k |
+| 8 conns + 16 idle | epoll×1 | **45,613** | 0.3 ms | 0.149 ms | 0.381 ms | 44k - 47k |
+| 8 conns + 16 idle | epoll×4 | **120,978** | 0.2 ms | 0.037 ms | 0.199 ms | 115k - 326k |
 
 **What the numbers say**
 
@@ -274,7 +325,7 @@ is the median of 5 runs, on a fresh server per cell. The thread-pool server ran 
    wakeups, taking one loop to 505k and 4 loops to **1.37M req/s**, the best
    median in the table. The pool's pipelined number swings 1.0-3.3M between runs, and its
    queued connections still wait 326 ms.
-5. **Variance.** Cells whose range is wide (pool at 8 and 256 conns, epoll-4 with idle
+5. **Variance.** Cells whose range is wide (pool at 8 and 256 conns, epoll×4 with idle
    connections) depend on where the scheduler places 8-16 busy threads on 4
    vCPUs shared with the client. Single-loop epoll is the most repeatable configuration
    (±3%) because it has the fewest threads to place.

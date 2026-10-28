@@ -22,9 +22,9 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SERVERS = [
-    ("thread pool (8 workers)", ["./server", "-t", "8", "-i", "2"]),
-    ("epoll (1 loop)", ["./epoll_server", "-t", "1"]),
-    ("epoll (4 loops)", ["./epoll_server", "-t", "4"]),
+    ("pool", ["./server", "-t", "8", "-i", "2"]),
+    ("epoll×1", ["./epoll_server", "-t", "1"]),
+    ("epoll×4", ["./epoll_server", "-t", "4"]),
 ]
 
 # (label, active connections, pipeline depth, idle connections)
@@ -99,15 +99,15 @@ def main():
         return "%.0fk" % (x / 1e3) if x < 1e6 else "%.2fM" % (x / 1e6)
 
     print()
-    print("| Workload | Server | Throughput (req/s) | range over %d runs | p50 RTT | p99 RTT "
-          "| worst first reply |" % args.reps)
+    print("| Workload | Server | req/s | worst first reply | p50 RTT | p99 RTT "
+          "| range (%d runs) |" % args.reps)
     print("|---|---|---:|---:|---:|---:|---:|")
     for wl_label, _, _, _ in WORKLOADS:
         for srv_label, _ in SERVERS:
             r = results[(wl_label, srv_label)]
-            print("| %s | %s | **%s** | %s - %s | %.3f ms | %.3f ms | %.1f ms |"
-                  % (wl_label, srv_label, format(int(r["rps"]), ","), k(r["lo"]), k(r["hi"]),
-                     r["p50_us"] / 1e3, r["p99_us"] / 1e3, r["first_max_us"] / 1e3))
+            print("| %s | %s | **%s** | %.1f ms | %.3f ms | %.3f ms | %s - %s |"
+                  % (wl_label, srv_label, format(int(r["rps"]), ","), r["first_max_us"] / 1e3,
+                     r["p50_us"] / 1e3, r["p99_us"] / 1e3, k(r["lo"]), k(r["hi"])))
 
 
 if __name__ == "__main__":
