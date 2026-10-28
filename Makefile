@@ -10,12 +10,15 @@ UNITS   := $(BUILD)/test_hashtable $(BUILD)/test_protocol $(BUILD)/test_threadpo
 
 .PHONY: all unit test clean
 
-all: server epoll_server
+all: server epoll_server client
 
 server: $(BUILD)/server.o $(BUILD)/threadpool.o $(COMMON)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 epoll_server: $(BUILD)/epoll_server.o $(COMMON)
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+client: $(BUILD)/client.o $(BUILD)/net.o
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 $(BUILD):
@@ -36,4 +39,4 @@ test: unit server epoll_server
 	python3 tests/functional_test.py --server ./epoll_server --extra=-t4
 
 clean:
-	rm -rf $(BUILD) server epoll_server
+	rm -rf $(BUILD) server epoll_server client

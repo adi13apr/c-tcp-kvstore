@@ -1,22 +1,24 @@
 /*
  * epoll_server.c - event-driven key-value server.
  *
- * Each event-loop thread (-t, default 1) owns an epoll instance and every
- * connection it accepts; there is no hand-off between threads. All loops
- * watch the same non-blocking listening socket (with EPOLLEXCLUSIVE when
- * there are several, so a new connection wakes only one loop) plus a shared
- * eventfd used to broadcast shutdown. The hash table is the only shared
- * state.
+ * One or more event-loop threads (-t, default 1), each with its own epoll
+ * instance; a connection lives on exactly one loop for its whole life, so
+ * per-connection state needs no locking. Loop 0 also owns the non-blocking
+ * listening socket and deals accepted connections round-robin: to itself
+ * directly, or to another loop by appending the fd to that loop's inbox and
+ * waking it through its eventfd. The hash table is the only state the loops
+ * share.
  *
  * Epoll is level-triggered and interest is toggled per connection:
  *   EPOLLIN  while the peer may send and pending output is under the
  *            high-water mark (backpressure for clients that don't read);
  *   EPOLLOUT only while a response is partially written.
  *
- * Shutdown (SIGINT/SIGTERM, received by the main thread via sigwait): each
- * loop stops accepting, shutdown(SHUT_RD)s its connections so already-sent
- * requests are read and answered, then exits once every connection has
- * flushed or a grace period expires.
+ * Shutdown (SIGINT/SIGTERM, received by the main thread via sigwait): the
+ * main thread signals a shared eventfd; each loop stops accepting and
+ * shutdown(SHUT_RD)s its connections so requests already sent are read and
+ * answered, then exits once every connection has flushed or a grace period
+ * expires.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -40,7 +42,7 @@
 
 #define DEFAULT_PORT 7379
 #define MAX_EVENTS 256
-#define ACCEPT_BATCH 64     /* accepts per wakeup, so one loop can't hog them */
+#define ACCEPT_BATCH 64      /* accepts per wakeup before serving others */
 #define READ_CHUNK 16384
 #define TRIM_CAP (64 * 1024) /* free idle buffers bigger than this */
 #define GRACE_MS 3000        /* max time to flush clients on shutdown */
@@ -56,23 +58,38 @@ typedef struct conn {
     struct conn *prev, *next;
 } conn_t;
 
+typedef struct loop loop_t;
+
 typedef struct {
-    int id;
-    int epfd;
+    loop_t *loops;
+    size_t nloops;
+    size_t next;       /* round-robin cursor, used only by loop 0 */
     int lfd;
     int stop_fd;
-    int spare_fd;      /* reserved fd for shedding connections at EMFILE */
     hashtable_t *table;
+} server_t;
+
+struct loop {
+    server_t *srv;
+    int id;
+    int epfd;
+    int wake_fd;       /* eventfd: "your inbox has new connections" */
+    int spare_fd;      /* reserved fd for shedding connections at EMFILE */
+
+    pthread_mutex_t inbox_lock;
+    int *inbox;        /* fds handed over by loop 0, not yet registered */
+    size_t inbox_len, inbox_cap;
+
     conn_t *conns;
     size_t nconns;
     int stopping;
     struct timespec deadline;
     unsigned long accepted;
     pthread_t tid;
-} loop_t;
+};
 
-/* Distinct addresses used as epoll tags for the two non-connection fds. */
-static char LISTEN_TAG, STOP_TAG;
+/* Distinct addresses used as epoll tags for the non-connection fds. */
+static char LISTEN_TAG, STOP_TAG, WAKE_TAG;
 
 static size_t out_pending(const conn_t *c)
 {
@@ -93,6 +110,34 @@ static void conn_close(loop_t *lp, conn_t *c)
     buf_free(&c->in);
     buf_free(&c->out);
     free(c);
+}
+
+/* Start serving fd on this loop (takes ownership of fd). */
+static void conn_add(loop_t *lp, int fd)
+{
+    conn_t *c = calloc(1, sizeof *c);
+    if (!c) {
+        close(fd);
+        return;
+    }
+    c->fd = fd;
+    buf_init(&c->in);
+    buf_init(&c->out);
+    c->events = EPOLLIN;
+    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = c };
+    if (epoll_ctl(lp->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        close(fd);
+        free(c);
+        return;
+    }
+    c->next = lp->conns;
+    if (lp->conns)
+        lp->conns->prev = c;
+    lp->conns = c;
+    lp->nconns++;
+    lp->accepted++;
+    if (lp->stopping)
+        shutdown(fd, SHUT_RD); /* handed over just as we began stopping */
 }
 
 /* One read per readiness event; level-triggering reports leftovers again.
@@ -147,7 +192,7 @@ static int conn_pump(loop_t *lp, conn_t *c)
         size_t used = 0;
         if (can_parse) {
             int close_after;
-            used = proto_process(lp->table, c->in.data, c->in.len,
+            used = proto_process(lp->srv->table, c->in.data, c->in.len,
                                  &c->out, &close_after);
             buf_consume(&c->in, used);
             c->closing |= close_after;
@@ -210,46 +255,81 @@ static void on_conn_event(loop_t *lp, conn_t *c, uint32_t events)
     conn_update(lp, c);
 }
 
+/* Queue fd for another loop and wake it. Falls back to serving it here. */
+static void hand_off(loop_t *self, loop_t *to, int fd)
+{
+    int queued = 0;
+    pthread_mutex_lock(&to->inbox_lock);
+    if (to->inbox_len == to->inbox_cap) {
+        size_t cap = to->inbox_cap ? to->inbox_cap * 2 : 64;
+        int *p = realloc(to->inbox, cap * sizeof *p);
+        if (p) {
+            to->inbox = p;
+            to->inbox_cap = cap;
+        }
+    }
+    if (to->inbox_len < to->inbox_cap) {
+        to->inbox[to->inbox_len++] = fd;
+        queued = 1;
+    }
+    pthread_mutex_unlock(&to->inbox_lock);
+
+    if (!queued) {
+        conn_add(self, fd);
+        return;
+    }
+    uint64_t one = 1;
+    if (write(to->wake_fd, &one, sizeof one) < 0) {
+        /* Counter overflow is impossible in practice; the loop also drains
+         * its inbox on every wakeup, so a lost write only delays it. */
+    }
+}
+
+/* Register every connection loop 0 has handed us. */
+static void drain_inbox(loop_t *lp)
+{
+    uint64_t cnt;
+    if (read(lp->wake_fd, &cnt, sizeof cnt) < 0) {
+        /* EAGAIN: already reset by an earlier drain */
+    }
+    pthread_mutex_lock(&lp->inbox_lock);
+    int *fds = lp->inbox;
+    size_t n = lp->inbox_len;
+    lp->inbox = NULL;
+    lp->inbox_len = lp->inbox_cap = 0;
+    pthread_mutex_unlock(&lp->inbox_lock);
+
+    for (size_t i = 0; i < n; i++)
+        conn_add(lp, fds[i]);
+    free(fds);
+}
+
 static void on_accept(loop_t *lp)
 {
+    server_t *s = lp->srv;
     for (int i = 0; i < ACCEPT_BATCH; i++) {
-        int fd = accept4(lp->lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        int fd = accept4(s->lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
             if ((errno == EMFILE || errno == ENFILE) && lp->spare_fd >= 0) {
                 /* Out of fds: level-triggered epoll would report the
                  * listener forever. Use the reserved fd to accept and
                  * immediately drop one client, then re-reserve. */
                 close(lp->spare_fd);
-                fd = accept(lp->lfd, NULL, NULL);
+                fd = accept(s->lfd, NULL, NULL);
                 if (fd >= 0)
                     close(fd);
                 lp->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
             }
-            return; /* EAGAIN (another loop got it), or transient error */
+            return; /* EAGAIN: backlog drained */
         }
         net_set_nodelay(fd);
 
-        conn_t *c = calloc(1, sizeof *c);
-        if (!c) {
-            close(fd);
-            continue;
-        }
-        c->fd = fd;
-        buf_init(&c->in);
-        buf_init(&c->out);
-        c->events = EPOLLIN;
-        struct epoll_event ev = { .events = EPOLLIN, .data.ptr = c };
-        if (epoll_ctl(lp->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            close(fd);
-            free(c);
-            continue;
-        }
-        c->next = lp->conns;
-        if (lp->conns)
-            lp->conns->prev = c;
-        lp->conns = c;
-        lp->nconns++;
-        lp->accepted++;
+        loop_t *to = &s->loops[s->next];
+        s->next = (s->next + 1) % s->nloops;
+        if (to == lp)
+            conn_add(lp, fd);
+        else
+            hand_off(lp, to, fd);
     }
 }
 
@@ -267,13 +347,15 @@ static void begin_stop(loop_t *lp)
     clock_gettime(CLOCK_MONOTONIC, &lp->deadline);
     lp->deadline.tv_sec += GRACE_MS / 1000;
 
-    /* The eventfd stays readable (nobody resets it) so every loop sees it;
-     * drop it and the listener from our set so they stop waking us. */
-    epoll_ctl(lp->epfd, EPOLL_CTL_DEL, lp->stop_fd, NULL);
-    epoll_ctl(lp->epfd, EPOLL_CTL_DEL, lp->lfd, NULL);
+    /* The stop eventfd stays readable (nobody resets it) so every loop sees
+     * it; drop it and the listener from our set so they stop waking us. */
+    epoll_ctl(lp->epfd, EPOLL_CTL_DEL, lp->srv->stop_fd, NULL);
+    if (lp->id == 0)
+        epoll_ctl(lp->epfd, EPOLL_CTL_DEL, lp->srv->lfd, NULL);
 
     /* Reads now return whatever the client already sent, then EOF, so the
      * normal event path answers those requests and closes the connection. */
+    drain_inbox(lp);
     for (conn_t *c = lp->conns; c; c = c->next)
         shutdown(c->fd, SHUT_RD);
 }
@@ -300,6 +382,8 @@ static void *loop_main(void *arg)
             } else if (tag == &LISTEN_TAG) {
                 if (!lp->stopping)
                     on_accept(lp);
+            } else if (tag == &WAKE_TAG) {
+                drain_inbox(lp);
             } else {
                 on_conn_event(lp, tag, evs[i].events);
             }
@@ -314,31 +398,42 @@ static void *loop_main(void *arg)
     return NULL;
 }
 
-static int loop_init(loop_t *lp, int id, int lfd, int stop_fd,
-                     hashtable_t *t, int exclusive)
+static int epoll_add_tag(int epfd, int fd, void *tag)
+{
+    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = tag };
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+static int loop_init(loop_t *lp, server_t *s, int id)
 {
     memset(lp, 0, sizeof *lp);
+    lp->srv = s;
     lp->id = id;
-    lp->lfd = lfd;
-    lp->stop_fd = stop_fd;
-    lp->table = t;
+    pthread_mutex_init(&lp->inbox_lock, NULL);
     lp->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    lp->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     lp->epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (lp->epfd < 0)
+    if (lp->epfd < 0 || lp->wake_fd < 0)
         return -1;
-
-    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = &STOP_TAG };
-    if (epoll_ctl(lp->epfd, EPOLL_CTL_ADD, stop_fd, &ev) < 0)
+    if (epoll_add_tag(lp->epfd, s->stop_fd, &STOP_TAG) < 0 ||
+        epoll_add_tag(lp->epfd, lp->wake_fd, &WAKE_TAG) < 0)
         return -1;
-    ev.events = EPOLLIN | (exclusive ? EPOLLEXCLUSIVE : 0);
-    ev.data.ptr = &LISTEN_TAG;
-    return epoll_ctl(lp->epfd, EPOLL_CTL_ADD, lfd, &ev);
+    if (id == 0 && epoll_add_tag(lp->epfd, s->lfd, &LISTEN_TAG) < 0)
+        return -1;
+    return 0;
 }
 
 static void loop_destroy(loop_t *lp)
 {
+    /* A hand-off can race with the target loop exiting; close leftovers. */
+    for (size_t i = 0; i < lp->inbox_len; i++)
+        close(lp->inbox[i]);
+    free(lp->inbox);
+    pthread_mutex_destroy(&lp->inbox_lock);
     if (lp->epfd >= 0)
         close(lp->epfd);
+    if (lp->wake_fd >= 0)
+        close(lp->wake_fd);
     if (lp->spare_fd >= 0)
         close(lp->spare_fd);
 }
@@ -382,55 +477,64 @@ int main(int argc, char **argv)
     sigaddset(&mask, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &mask, NULL);
 
-    int lfd = net_listen(addr, (int)port, 1024);
-    if (lfd < 0)
+    server_t s = { .nloops = (size_t)nloops };
+    s.lfd = net_listen(addr, (int)port, 1024);
+    if (s.lfd < 0)
         return 1;
-    int stop_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    hashtable_t *table = ht_create(1024, 64);
-    loop_t *loops = calloc((size_t)nloops, sizeof *loops);
-    if (stop_fd < 0 || !table || !loops) {
+    s.stop_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    s.table = ht_create(1024, 64);
+    s.loops = calloc(s.nloops, sizeof *s.loops);
+    if (s.stop_fd < 0 || !s.table || !s.loops) {
         fprintf(stderr, "startup failed\n");
         return 1;
     }
 
-    long started = 0;
-    for (; started < nloops; started++) {
-        loop_t *lp = &loops[started];
-        if (loop_init(lp, (int)started, lfd, stop_fd, table, nloops > 1) < 0 ||
-            pthread_create(&lp->tid, NULL, loop_main, lp) != 0) {
+    /* Initialise every loop before starting any: loop 0 may hand a
+     * connection to loop N as soon as it runs. */
+    int rc = 0;
+    size_t inited = 0, started = 0;
+    for (; inited < s.nloops; inited++) {
+        if (loop_init(&s.loops[inited], &s, (int)inited) < 0) {
             perror("event loop init");
-            loop_destroy(lp);
+            loop_destroy(&s.loops[inited]);
+            rc = 1;
+            break;
+        }
+    }
+    for (; rc == 0 && started < s.nloops; started++) {
+        if (pthread_create(&s.loops[started].tid, NULL, loop_main,
+                           &s.loops[started]) != 0) {
+            perror("pthread_create");
+            rc = 1;
             break;
         }
     }
 
-    int rc = 0;
-    if (started == nloops) {
+    if (rc == 0) {
         fprintf(stderr, "epoll_server: listening on %s:%ld (%ld event loop%s)\n",
                 addr, port, nloops, nloops == 1 ? "" : "s");
         int sig;
         sigwait(&mask, &sig);
         fprintf(stderr, "epoll_server: caught %s, shutting down\n", strsignal(sig));
-    } else {
-        rc = 1;
     }
 
     uint64_t one = 1;
-    if (write(stop_fd, &one, sizeof one) != (ssize_t)sizeof one)
+    if (write(s.stop_fd, &one, sizeof one) != (ssize_t)sizeof one)
         perror("eventfd write");
 
     unsigned long accepted = 0;
-    for (long i = 0; i < started; i++) {
-        pthread_join(loops[i].tid, NULL);
-        accepted += loops[i].accepted;
-        loop_destroy(&loops[i]);
+    for (size_t i = 0; i < started; i++)
+        pthread_join(s.loops[i].tid, NULL);
+    for (size_t i = 0; i < inited; i++) {
+        accepted += s.loops[i].accepted;
+        loop_destroy(&s.loops[i]);
     }
 
     fprintf(stderr, "epoll_server: done (%lu connections served, %zu keys freed)\n",
-            accepted, ht_count(table));
-    free(loops);
-    ht_destroy(table);
-    close(stop_fd);
-    close(lfd);
+            accepted, ht_count(s.table));
+    free(s.loops);
+    ht_destroy(s.table);
+    close(s.stop_fd);
+    close(s.lfd);
     return rc;
 }
