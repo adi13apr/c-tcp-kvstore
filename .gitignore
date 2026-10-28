@@ -1,0 +1,6 @@
+build/
+/server
+/epoll_server
+/client
+*.o
+__pycache__/
