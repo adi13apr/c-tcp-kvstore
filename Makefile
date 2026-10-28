@@ -5,11 +5,15 @@ CFLAGS  += -std=c11 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-con
 LDFLAGS += -pthread
 
 BUILD   := build
-COMMON  := $(BUILD)/hashtable.o $(BUILD)/buffer.o $(BUILD)/protocol.o
+COMMON  := $(BUILD)/hashtable.o $(BUILD)/buffer.o $(BUILD)/protocol.o $(BUILD)/net.o
+UNITS   := $(BUILD)/test_hashtable $(BUILD)/test_protocol $(BUILD)/test_threadpool
 
-.PHONY: all test unit clean
+.PHONY: all unit test clean
 
-all: unit
+all: server
+
+server: $(BUILD)/server.o $(BUILD)/threadpool.o $(COMMON)
+	$(CC) $^ -o $@ $(LDFLAGS)
 
 $(BUILD):
 	mkdir -p $@
@@ -17,17 +21,14 @@ $(BUILD):
 $(BUILD)/%.o: src/%.c src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/test_hashtable: tests/test_hashtable.c tests/test.h $(COMMON)
-	$(CC) $(CFLAGS) -Itests $< $(COMMON) -o $@ $(LDFLAGS)
+$(BUILD)/test_%: tests/test_%.c tests/test.h $(COMMON) $(BUILD)/threadpool.o
+	$(CC) $(CFLAGS) -Itests $< $(COMMON) $(BUILD)/threadpool.o -o $@ $(LDFLAGS)
 
-$(BUILD)/test_protocol: tests/test_protocol.c tests/test.h $(COMMON)
-	$(CC) $(CFLAGS) -Itests $< $(COMMON) -o $@ $(LDFLAGS)
+unit: $(UNITS)
+	@for t in $(UNITS); do ./$$t || exit 1; done
 
-unit: $(BUILD)/test_hashtable $(BUILD)/test_protocol
-	$(BUILD)/test_hashtable
-	$(BUILD)/test_protocol
-
-test: unit
+test: unit server
+	python3 tests/functional_test.py --server ./server
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) server
