@@ -8,7 +8,7 @@ BUILD   := build
 COMMON  := $(BUILD)/hashtable.o $(BUILD)/buffer.o $(BUILD)/protocol.o $(BUILD)/net.o
 UNITS   := $(BUILD)/test_hashtable $(BUILD)/test_protocol $(BUILD)/test_threadpool
 
-.PHONY: all unit test clean
+.PHONY: all unit test valgrind bench clean
 
 all: server epoll_server client
 
@@ -37,6 +37,12 @@ test: unit server epoll_server
 	python3 tests/functional_test.py --server ./server
 	python3 tests/functional_test.py --server ./epoll_server
 	python3 tests/functional_test.py --server ./epoll_server --extra=-t4
+
+valgrind: all $(UNITS)
+	tests/valgrind_check.sh
+
+bench: all
+	python3 bench/run_bench.py
 
 clean:
 	rm -rf $(BUILD) server epoll_server client
