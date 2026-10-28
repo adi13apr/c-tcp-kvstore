@@ -5,7 +5,7 @@ CFLAGS  += -std=c11 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-con
 LDFLAGS += -pthread
 
 BUILD   := build
-COMMON  := $(BUILD)/hashtable.o $(BUILD)/buffer.o
+COMMON  := $(BUILD)/hashtable.o $(BUILD)/buffer.o $(BUILD)/protocol.o
 
 .PHONY: all test unit clean
 
@@ -20,8 +20,12 @@ $(BUILD)/%.o: src/%.c src/*.h | $(BUILD)
 $(BUILD)/test_hashtable: tests/test_hashtable.c tests/test.h $(COMMON)
 	$(CC) $(CFLAGS) -Itests $< $(COMMON) -o $@ $(LDFLAGS)
 
-unit: $(BUILD)/test_hashtable
+$(BUILD)/test_protocol: tests/test_protocol.c tests/test.h $(COMMON)
+	$(CC) $(CFLAGS) -Itests $< $(COMMON) -o $@ $(LDFLAGS)
+
+unit: $(BUILD)/test_hashtable $(BUILD)/test_protocol
 	$(BUILD)/test_hashtable
+	$(BUILD)/test_protocol
 
 test: unit
 
