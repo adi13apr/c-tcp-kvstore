@@ -10,9 +10,12 @@ UNITS   := $(BUILD)/test_hashtable $(BUILD)/test_protocol $(BUILD)/test_threadpo
 
 .PHONY: all unit test clean
 
-all: server
+all: server epoll_server
 
 server: $(BUILD)/server.o $(BUILD)/threadpool.o $(COMMON)
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+epoll_server: $(BUILD)/epoll_server.o $(COMMON)
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 $(BUILD):
@@ -27,8 +30,10 @@ $(BUILD)/test_%: tests/test_%.c tests/test.h $(COMMON) $(BUILD)/threadpool.o
 unit: $(UNITS)
 	@for t in $(UNITS); do ./$$t || exit 1; done
 
-test: unit server
+test: unit server epoll_server
 	python3 tests/functional_test.py --server ./server
+	python3 tests/functional_test.py --server ./epoll_server
+	python3 tests/functional_test.py --server ./epoll_server --extra=-t4
 
 clean:
-	rm -rf $(BUILD) server
+	rm -rf $(BUILD) server epoll_server

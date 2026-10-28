@@ -32,7 +32,7 @@ def free_port():
 class Server:
     def __init__(self, extra=()):
         self.port = free_port()
-        cmd = [ARGS.server, "-p", str(self.port), *extra]
+        cmd = [ARGS.server, "-p", str(self.port), *ARGS.extra.split(), *extra]
         if ARGS.valgrind:
             cmd = ["valgrind", "-q", "--leak-check=full", "--show-leak-kinds=all",
                    "--errors-for-leak-kinds=all", "--error-exitcode=99"] + cmd
@@ -147,6 +147,20 @@ def t_big_values(port):
     c.close()
 
 
+def t_backpressure_resume(port):
+    """Client sends every request, then reads only after the server's output
+    is blocked. The server must resume parsing buffered requests once its
+    output drains, without waiting for more input that will never come."""
+    c = Client(port)
+    val = b"b" * 60000
+    assert c.cmd(b"SET bp " + val) == b"OK"
+    c.send(b"GET bp\n" * 100)  # ~6 MB of responses, far above the high-water mark
+    time.sleep(0.5)
+    for _ in range(100):
+        assert c.line() == b"VALUE " + val
+    c.close()
+
+
 def t_line_too_long(port):
     c = Client(port)
     c.send(b"SET k " + b"y" * (MAX_LINE + 10))
@@ -234,7 +248,8 @@ def t_graceful_shutdown():
     assert code == 0, "exit code %d\n%s" % (code, err)
 
 
-TESTS = [t_basic, t_split_writes, t_pipelining, t_big_values, t_line_too_long,
+TESTS = [t_basic, t_split_writes, t_pipelining, t_big_values, t_backpressure_resume,
+         t_line_too_long,
          t_abrupt_disconnects, t_half_close, t_concurrent]
 
 
@@ -243,8 +258,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server", required=True)
     ap.add_argument("--valgrind", action="store_true")
+    ap.add_argument("--extra", default="", help="extra server args, e.g. --extra=-t4")
     ARGS = ap.parse_args()
-    name = os.path.basename(ARGS.server) + (" (valgrind)" if ARGS.valgrind else "")
+    name = " ".join([os.path.basename(ARGS.server), ARGS.extra]).strip()
+    name += " (valgrind)" if ARGS.valgrind else ""
     failed = 0
 
     srv = Server()
